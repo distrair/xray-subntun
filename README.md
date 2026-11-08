@@ -7,5 +7,6 @@
 4. create a `subscription.url` file inside `/etc/xray/`
 5. `sudo xray-sub list` then `sudo xray-sub use N` or if you want ipv6 `sudo xray-sub --ipv6 use N`
 6. `sudo systemctl enable --now xray-tun` for it to be enabled on startup and started (if you just want to start it without autostart on startup `sudo systemctl start xray-tun`)
+
 it will also remove `inbounds` that are present in the configs, only keeping `inbounds` that are needed for the tunnel to work
 it also caches the subsctiption for an offline use!
