@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""xray-sub: turn a VLESS subscription into an Xray config with a TUN inbound.
+
+  xray-sub list            show the servers in the subscription
+  xray-sub use <number>    write the config for that server (then restart the service)
+  xray-sub import <file>.. add local Xray configs / link lists to the list (kept in /etc/xray/profiles)
+  xray-sub current         show which config is currently written for the service
+  xray-sub update-geodata  download/refresh geoip.dat + geosite.dat (restart the service after)
+  add --ipv6 (before `use`) to route IPv6 through the tunnel too
+
+If the subscription can't be downloaded, the last good copy is used instead
+(kept in /var/lib/xray/subscription.cache, readable by root only).
+
+`use` downloads the .dat files by itself when the config needs geoip:/geosite:
+rules and they are missing. The service reads them from /var/lib/xray.
+
+Local profiles are listed after the subscription's entries and work offline; if there is
+no subscription URL file at all, only the local ones are used.
+
+The subscription URL is read from a file (default /etc/xray/subscription.url,
+chmod 600) so it never shows up in shell history or `ps`.
+Nothing about your device is sent: the only header is a generic User-Agent.
+Two subscription formats are understood:
+  * share links: vless:// only (tcp / ws / grpc / xhttp / httpupgrade,
+    with reality, tls or no security). These use the built-in DNS setup.
+  * JSON profiles: full Xray configs. Their own dns / routing / outbounds are
+    kept, so the profile's DNS settings are what actually gets used.
+    Pass --builtin-dns to ignore a profile's DNS and use the built-in one.
+"""
+import argparse
+import base64
+import copy
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from urllib.parse import parse_qs, unquote, urlsplit
+
+URL_FILE = "/etc/xray/subscription.url"
+OUT_FILE = "/etc/xray/tun.json"
+TUN_NAME = "xray0"
+# Explicit ranges instead of geoip:private, so no geoip.dat is needed.
+PRIVATE_NETS = [
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10",
+]
+PRIVATE_NETS_V6 = ["::1/128", "fc00::/7", "fe80::/10"]
+
+GEO_DIR = "/var/lib/xray"
+CACHE_FILE = "/var/lib/xray/subscription.cache"
+LOCAL_DIR = "/etc/xray/profiles"  # profiles imported from local files
+STATE_FILE = "/var/lib/xray/current.json"  # name of the profile last written by `use`
+GEO_BASE = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+GEO_FILES = ("geoip.dat", "geosite.dat")
+
+
+def fetch_raw(url, user_agent, timeout=20, strip=True):
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read()
+    return data.strip() if strip else data
+
+
+def get_subscription(url, user_agent, cache_path):
+    """Download the subscription; fall back to the last good copy if that fails."""
+    try:
+        raw = fetch_raw(url, user_agent)
+        entries = load_entries(raw)
+        if not entries:
+            raise ValueError("response contained no usable profiles")
+    except Exception as err:
+        if not os.path.exists(cache_path):
+            sys.exit(f"could not download the subscription ({err}) and there is no cached copy")
+        with open(cache_path, "rb") as f:
+            entries = load_entries(f.read())
+        age_h = (time.time() - os.path.getmtime(cache_path)) / 3600
+        print(f"warning: download failed ({err}); using the cached list from "
+              f"{age_h:.1f} h ago", file=sys.stderr)
+        return entries
+
+    # Only a response that parsed into profiles is cached, so a captive-portal page
+    # or an error page can never replace a good copy. It holds your keys: 0600.
+    os.makedirs(os.path.dirname(cache_path), mode=0o755, exist_ok=True)
+    tmp = cache_path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
+    os.replace(tmp, cache_path)
+    return entries
+
+
+def load_entries(raw, label=None):
+    """Return a list of {"name", "kind": "link"|"json", "data"} entries."""
+    # JSON profiles: a list of Xray configs, or a single one.
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict):
+        doc = [doc]
+    if isinstance(doc, list) and all(isinstance(d, dict) for d in doc):
+        def fallback(i):
+            if label is None:
+                return f"profile {i}"
+            return label if len(doc) == 1 else f"{label} {i}"  # local files: name after the file
+        return [
+            {"name": d.get("remarks") or d.get("name") or fallback(i), "kind": "json", "data": d}
+            for i, d in enumerate(doc, 1)
+        ]
+
+    # Share links: usually base64 of newline-separated links, sometimes plain text.
+    if b"://" not in raw[:20]:
+        raw = raw.replace(b"-", b"+").replace(b"_", b"/")
+        raw += b"=" * (-len(raw) % 4)
+        raw = base64.b64decode(raw)
+    links = [l.strip() for l in raw.decode("utf-8", "replace").splitlines() if l.strip()]
+    entries = []
+    for l in links:
+        if l.startswith("vless://"):
+            n = parse_vless(l)
+            entries.append({"name": n["name"], "kind": "link", "data": n})
+    return entries
+
+
+def parse_vless(link):
+    u = urlsplit(link)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    return {
+        "name": unquote(u.fragment) or u.hostname,
+        "uuid": u.username,
+        "host": u.hostname,
+        "port": u.port or 443,
+        "q": q,
+    }
+
+
+def resolve(host):
+    # Resolve once here so the outbound uses a fixed IP (no DNS needed to reach
+    # the server, which avoids a chicken-and-egg problem once the tunnel is up).
+    try:
+        return socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+    except OSError:
+        # offline / DNS down: let Xray resolve it later instead of failing here
+        print(f"warning: could not resolve {host}, leaving the hostname in the config", file=sys.stderr)
+        return host
+
+
+def build_outbound(n):
+    q = n["q"]
+    net = q.get("type", "tcp")
+    sec = q.get("security", "none")
+
+    user = {"id": n["uuid"], "encryption": q.get("encryption", "none")}
+    if q.get("flow"):
+        user["flow"] = q["flow"]
+
+    ss = {"network": net, "security": sec}
+    if sec == "reality":
+        ss["realitySettings"] = {
+            "serverName": q.get("sni", ""),
+            "fingerprint": q.get("fp", "chrome"),
+            "publicKey": q.get("pbk", ""),
+            "shortId": q.get("sid", ""),
+            "spiderX": q.get("spx", ""),
+        }
+    elif sec == "tls":
+        tls = {"serverName": q.get("sni", n["host"]), "fingerprint": q.get("fp", "chrome")}
+        if q.get("alpn"):
+            tls["alpn"] = q["alpn"].split(",")
+        ss["tlsSettings"] = tls
+
+    path = unquote(q.get("path", "/"))
+    host = q.get("host", "")
+    if net == "ws":
+        ss["wsSettings"] = {"path": path, "headers": {"Host": host} if host else {}}
+    elif net == "grpc":
+        ss["grpcSettings"] = {"serviceName": q.get("serviceName", ""), "multiMode": q.get("mode") == "multi"}
+    elif net == "xhttp":
+        ss["xhttpSettings"] = {"path": path, "host": host, "mode": q.get("mode", "auto")}
+    elif net == "httpupgrade":
+        ss["httpupgradeSettings"] = {"path": path, "host": host}
+
+    return {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {"vnext": [{"address": resolve(n["host"]), "port": n["port"], "users": [user]}]},
+        "streamSettings": ss,
+    }
+
+
+def update_geodata(directory, base, user_agent):
+    """Download geoip.dat / geosite.dat, verify their published sha256, install atomically."""
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    for name in GEO_FILES:
+        data = fetch_raw(f"{base}/{name}", user_agent, timeout=120, strip=False)  # binary: no stripping
+        want = fetch_raw(f"{base}/{name}.sha256sum", user_agent).split()[0].decode()
+        got = hashlib.sha256(data).hexdigest()
+        if got != want:
+            sys.exit(f"checksum mismatch for {name}, keeping the old file")
+        dest = os.path.join(directory, name)
+        tmp = dest + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)  # old file stays intact if anything above failed
+        print(f"installed {dest} ({len(data) // 1024} KiB, sha256 ok)")
+
+
+def needs_geodata(cfg):
+    text = json.dumps(cfg)
+    return "geoip:" in text or "geosite:" in text
+
+
+def tun_inbound(tun_name, ipv6):
+    return {
+        "tag": "tun-in",
+        "port": 0,
+        "protocol": "tun",
+        "settings": {
+            "name": tun_name,
+            "MTU": 1500,
+            "gateway": ["172.19.0.1/30"] + (["fdfe:dcba:9876::1/126"] if ipv6 else []),
+            # Xray adds/removes these system routes itself.
+            "autoSystemRoutingTable": ["0.0.0.0/0"] + (["::/0"] if ipv6 else []),
+            # Binds Xray's own outbound sockets to the real uplink,
+            # which is what prevents the routing loop.
+            "autoOutboundsInterface": "auto",
+        },
+        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+    }
+
+
+def builtin_dns(ipv6):
+    # Fallback used for share links and for profiles that carry no dns section.
+    return {
+        "port": 53,
+        "queryStrategy": "UseIP" if ipv6 else "UseIPv4",
+        "servers": [
+            "https://dns.quad9.net/dns-query",
+            "9.9.9.9",
+            "1.1.1.1",
+            "8.8.8.8",
+            "77.88.8.8",
+            {"address": "77.88.8.8", "domains": ["geosite:category-ru"]},
+        ],
+    }
+
+
+def build_config(outbound, tun_name, ipv6=False):
+    return {
+        "log": {"loglevel": "warning"},
+        "dns": builtin_dns(ipv6),
+        "inbounds": [tun_inbound(tun_name, ipv6)],
+        "outbounds": [
+            outbound,
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "dns-out", "protocol": "dns"},
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "inboundTag": ["tun-in"], "port": "53", "outboundTag": "dns-out"},
+                {"type": "field", "ip": PRIVATE_NETS + (PRIVATE_NETS_V6 if ipv6 else []), "outboundTag": "direct"},
+            ],
+        },
+    }
+
+
+def build_from_profile(profile, tun_name, ipv6, builtin):
+    """Use a full Xray JSON profile as-is, but swap its inbounds for the TUN."""
+    cfg = copy.deepcopy(profile)
+    cfg.pop("remarks", None)
+    cfg["inbounds"] = [tun_inbound(tun_name, ipv6)]
+    # metrics / api can open a local listener of their own: nothing should listen.
+    cfg.pop("metrics", None)
+    cfg.pop("api", None)
+
+    outs = cfg.setdefault("outbounds", [])
+    dns_tag = next((o.get("tag") for o in outs if o.get("protocol") == "dns"), None)
+    if dns_tag is None:
+        dns_tag = "dns-out"
+        outs.append({"tag": dns_tag, "protocol": "dns"})
+    if not any(o.get("tag") == "direct" for o in outs):
+        outs.append({"tag": "direct", "protocol": "freedom"})
+
+    if builtin or not (cfg.get("dns") or {}).get("servers"):
+        cfg["dns"] = builtin_dns(ipv6)
+
+    # Hand every port-53 lookup from apps to Xray's own resolver (only traffic
+    # entering via the TUN, not Xray's own queries), otherwise the
+    # profile's dns section would never be consulted for them.
+    routing = cfg.setdefault("routing", {})
+    routing.setdefault("rules", []).insert(0, {"type": "field", "inboundTag": ["tun-in"], "port": "53", "outboundTag": dns_tag})
+    return cfg
+
+
+def usable(entry):
+    """A JSON profile needs at least one real proxy outbound; share links are always fine."""
+    if entry["kind"] == "link":
+        return True
+    outs = entry["data"].get("outbounds")
+    return isinstance(outs, list) and any(
+        isinstance(o, dict) and o.get("protocol") not in ("freedom", "blackhole", "dns", "loopback")
+        for o in outs
+    )
+
+
+def load_local(directory):
+    entries = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return entries
+    for fname in names:
+        if fname.startswith(".") or fname.endswith(".tmp"):
+            continue
+        try:
+            with open(os.path.join(directory, fname), "rb") as f:
+                found = load_entries(f.read().strip(), label=os.path.splitext(fname)[0])
+        except Exception as err:
+            print(f"warning: skipping local profile {fname} ({err})", file=sys.stderr)
+            continue
+        for e in found:
+            if usable(e):
+                e["source"] = "local"
+                entries.append(e)
+    return entries
+
+
+def import_files(paths, directory):
+    """Copy local config files into the profiles directory (0600: they contain keys)."""
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            found = load_entries(raw.strip(), label=os.path.splitext(os.path.basename(path))[0])
+        except OSError as err:
+            print(f"skipped {path}: {err}", file=sys.stderr)
+            continue
+        except Exception:
+            print(f"skipped {path}: not an Xray JSON config or a list of vless:// links", file=sys.stderr)
+            continue
+        good = [e for e in found if usable(e)]
+        if not good:
+            print(f"skipped {path}: no usable profile (needs an Xray config with a proxy outbound, "
+                  "or vless:// links)", file=sys.stderr)
+            continue
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(path))
+        dest = os.path.join(directory, safe)
+        existed = os.path.exists(dest)
+        tmp = dest + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        os.replace(tmp, dest)
+        names = ", ".join(e["name"] for e in good[:3]) + (" ..." if len(good) > 3 else "")
+        skipped = f", {len(found) - len(good)} unusable ignored" if len(found) > len(good) else ""
+        print(f"{'updated' if existed else 'imported'} {safe}: {len(good)} profile(s) [{names}]{skipped}")
+
+
+def save_state(path, name, number, kind, config, ipv6):
+    os.makedirs(os.path.dirname(path) or ".", mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"name": name, "number": number, "kind": kind, "config": config,
+                   "ipv6": ipv6, "written": time.time()}, f)
+    os.replace(tmp, path)
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def active_number(entries, state):
+    """Which entry in the current list is the one that was written (by name, then number)."""
+    if not state:
+        return None
+    same = [i for i, e in enumerate(entries, 1) if e["name"] == state.get("name")]
+    if state.get("number") in same:
+        return state["number"]
+    return same[0] if same else None
+
+
+def human_age(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds} s ago"
+    if seconds < 5400:
+        return f"{seconds // 60} min ago"
+    if seconds < 172800:
+        return f"{seconds // 3600} h ago"
+    return f"{seconds // 86400} days ago"
+
+
+def show_current(state_path):
+    st = load_state(state_path)
+    if not st:
+        print("no config has been written yet: run `xray-sub use <number>` first")
+        return
+    print(f"current config: {st['name']}")
+    extra = ", IPv6" if st.get("ipv6") else ""
+    print(f"  entry #{st.get('number')} in the list ({st.get('kind')}{extra})")
+    print(f"  written {time.strftime('%Y-%m-%d %H:%M', time.localtime(st['written']))} "
+          f"({human_age(time.time() - st['written'])}) to {st.get('config')}")
+    try:
+        mtime = os.path.getmtime(st["config"])
+        if mtime > st["written"] + 5:
+            print("  note: that file was modified after xray-sub wrote it, so the name may not match")
+    except (OSError, KeyError):
+        print("  note: the config file no longer exists")
+    try:
+        r = subprocess.run(["systemctl", "is-active", "xray-tun"], capture_output=True, text=True, timeout=5)
+        print(f"  service xray-tun: {r.stdout.strip() or 'unknown'}"
+              "   (restart it after `use` for a new config to take effect)")
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--url-file", default=URL_FILE)
+    ap.add_argument("--out", default=OUT_FILE)
+    ap.add_argument("--cache-file", default=CACHE_FILE, help="last good copy of the subscription")
+    ap.add_argument("--local-dir", default=LOCAL_DIR, help="where imported local profiles are kept")
+    ap.add_argument("--state-file", default=STATE_FILE, help="remembers which profile `use` wrote last")
+    ap.add_argument("--tun-name", default=TUN_NAME)
+    ap.add_argument("--ipv6", action="store_true", help="also route IPv6 through the tunnel")
+    ap.add_argument("--builtin-dns", action="store_true", help="ignore a JSON profile's dns section")
+    ap.add_argument("--user-agent", default="v2rayNG/1.4.8.8",
+                    help="some providers pick the subscription format from the User-Agent")
+    ap.add_argument("--geo-dir", default=GEO_DIR, help="where geoip.dat / geosite.dat live")
+    ap.add_argument("--geodata-base", default=GEO_BASE, help="download base URL (use a mirror if GitHub is blocked)")
+    ap.add_argument("--no-geodata", action="store_true", help="never download .dat files automatically")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    sub.add_parser("update-geodata")
+    sub.add_parser("current")
+    p_imp = sub.add_parser("import")
+    p_imp.add_argument("files", nargs="+", help="Xray JSON config(s) or files with vless:// links")
+    p = sub.add_parser("use")
+    p.add_argument("number", type=int)
+    args = ap.parse_args()
+
+    if args.cmd == "update-geodata":
+        update_geodata(args.geo_dir, args.geodata_base, args.user_agent)
+        return
+    if args.cmd == "current":
+        show_current(args.state_file)
+        return
+    if args.cmd == "import":
+        import_files(args.files, args.local_dir)
+        return
+
+    local = load_local(args.local_dir)
+    entries = []
+    if os.path.exists(args.url_file):
+        with open(args.url_file) as f:
+            url = f.read().strip()
+        try:
+            entries = get_subscription(url, args.user_agent, args.cache_file)
+        except SystemExit as err:
+            if not local:
+                raise
+            print(f"warning: {err.code}; showing local profiles only", file=sys.stderr)
+    elif not local:
+        sys.exit(f"no subscription URL file at {args.url_file} and no local profiles: "
+                 "put the URL there or run `xray-sub import FILE`")
+    entries = entries + local  # subscription entries first, local ones after
+
+    if args.cmd == "list":
+        active = active_number(entries, load_state(args.state_file))
+        for i, e in enumerate(entries, 1):
+            if e["kind"] == "link":
+                q = e["data"]["q"]
+                info = f"link {q.get('type', 'tcp')}/{q.get('security', 'none')}, builtin dns"
+            else:
+                info = "json, " + ("own dns" if e["data"].get("dns") else "no dns -> builtin")
+            tag = "local " if e.get("source") == "local" else ""
+            print(f"{'*' if i == active else ' '}{i:3}  {e['name']}  [{tag}{info}]")
+        return
+
+    if not 1 <= args.number <= len(entries):
+        sys.exit(f"pick a number between 1 and {len(entries)}")
+    e = entries[args.number - 1]
+    if e["kind"] == "link":
+        cfg = build_config(build_outbound(e["data"]), args.tun_name, args.ipv6)
+    else:
+        cfg = build_from_profile(e["data"], args.tun_name, args.ipv6, args.builtin_dns)
+
+    # The config contains your server's keys: keep it readable by the owner only.
+    fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"wrote {args.out} for: {e['name']}")
+    kind = ("local " if e.get("source") == "local" else "") + e["kind"]
+    save_state(args.state_file, e["name"], args.number, kind, args.out, args.ipv6)
+
+    # geoip:/geosite: rules (from the profile or the DNS fallback) need the .dat files.
+    if needs_geodata(cfg) and not args.no_geodata:
+        if not all(os.path.exists(os.path.join(args.geo_dir, n)) for n in GEO_FILES):
+            print("config uses geoip:/geosite: rules, downloading the .dat files...")
+            try:
+                update_geodata(args.geo_dir, args.geodata_base, args.user_agent)
+            except Exception as err:  # keep the config, just tell the user
+                print(f"warning: geodata download failed ({err}); Xray will not start until "
+                      f"geoip.dat/geosite.dat are in {args.geo_dir}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

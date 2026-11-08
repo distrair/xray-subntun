@@ -1,0 +1,26 @@
+[Unit]
+Description=Xray with TUN inbound
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=XRAY_LOCATION_ASSET=/var/lib/xray
+ExecStart=/usr/bin/xray run -c /etc/xray/tun.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+# Runs as root but with only the capabilities it needs
+# (create the TUN device, add routes, bind sockets to the uplink).
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
